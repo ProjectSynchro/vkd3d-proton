@@ -12048,6 +12048,7 @@ static bool d3d12_command_list_clear_uninitialized_rtv(struct d3d12_command_list
         VkPipelineStageFlags2 src_stage_mask, VkAccessFlags2 src_access_mask,
         VkPipelineStageFlags2 dst_stage_mask, VkAccessFlags2 dst_access_mask)
 {
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
     VkImageSubresourceRange range;
     VkImageMemoryBarrier2 vk_transition;
     VkClearColorValue clear_value;
