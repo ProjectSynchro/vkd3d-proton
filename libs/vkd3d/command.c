@@ -12042,6 +12042,52 @@ static const char *vkd3d_resource_state_to_str(D3D12_RESOURCE_STATES resource_st
     return "???";
 }
 
+static bool d3d12_command_list_clear_uninitialized_rtv(struct d3d12_command_list *list,
+        struct d3d12_command_list_barrier_batch *batch, struct d3d12_resource *resource,
+        UINT subresource_idx, VkImageLayout old_layout, VkImageLayout target_layout,
+        VkPipelineStageFlags2 src_stage_mask, VkAccessFlags2 src_access_mask,
+        VkPipelineStageFlags2 dst_stage_mask, VkAccessFlags2 dst_access_mask)
+{
+    VkImageSubresourceRange range;
+    VkImageMemoryBarrier2 vk_transition;
+    VkClearColorValue clear_value;
+
+    if (!resource->needs_initial_clear)
+        return false;
+    if (!(resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+        return false;
+    if (!(resource->format->vk_aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+
+    d3d12_command_list_barrier_batch_end(list, batch);
+
+    vk_image_memory_barrier_for_transition(&vk_transition,
+            resource, subresource_idx, old_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            src_stage_mask, src_access_mask,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            0);
+    d3d12_command_list_barrier_batch_add_layout_transition(list, batch, &vk_transition);
+    d3d12_command_list_barrier_batch_end(list, batch);
+
+    memset(&clear_value, 0, sizeof(clear_value));
+    range = vk_transition.subresourceRange;
+    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+
+    VK_CALL(vkCmdClearColorImage(list->cmd.vk_command_buffer, resource->res.vk_image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear_value, 1, &range));
+
+    vk_image_memory_barrier_for_transition(&vk_transition,
+            resource, subresource_idx, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, target_layout,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            dst_stage_mask, dst_access_mask,
+            0);
+    d3d12_command_list_barrier_batch_add_layout_transition(list, batch, &vk_transition);
+    d3d12_command_list_barrier_batch_end(list, batch);
+
+    resource->needs_initial_clear = false;
+    return true;
+}
+
 static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_list_iface *iface,
         UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers)
 {
@@ -12195,14 +12241,27 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
                 if (d3d12_resource_is_texture(preserve_resource))
                 {
                     VkImageMemoryBarrier2 vk_transition;
+                    bool cleared = false;
+
                     new_layout = vk_image_layout_from_d3d12_resource_state(list, preserve_resource, transition->StateAfter);
-                    vk_image_memory_barrier_for_transition(&vk_transition,
-                            preserve_resource,
-                            transition->Subresource, old_layout, new_layout,
-                            transition_src_stage_mask, transition_src_access,
-                            transition_dst_stage_mask, transition_dst_access,
-                            dsv_decay_mask);
-                    d3d12_command_list_barrier_batch_add_layout_transition(list, &batch, &vk_transition);
+
+                    if ((transition->StateAfter & D3D12_RESOURCE_STATE_RENDER_TARGET) &&
+                            d3d12_command_list_clear_uninitialized_rtv(list, &batch, preserve_resource,
+                                    transition->Subresource, old_layout, new_layout,
+                                    transition_src_stage_mask, transition_src_access,
+                                    transition_dst_stage_mask, transition_dst_access))
+                        cleared = true;
+
+                    if (!cleared)
+                    {
+                        vk_image_memory_barrier_for_transition(&vk_transition,
+                                preserve_resource,
+                                transition->Subresource, old_layout, new_layout,
+                                transition_src_stage_mask, transition_src_access,
+                                transition_dst_stage_mask, transition_dst_access,
+                                dsv_decay_mask);
+                        d3d12_command_list_barrier_batch_add_layout_transition(list, &batch, &vk_transition);
+                    }
                 }
                 else
                 {

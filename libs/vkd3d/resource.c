@@ -3936,6 +3936,13 @@ static HRESULT d3d12_resource_create(struct d3d12_device *device, uint32_t flags
         object->flags |= VKD3D_RESOURCE_ACCELERATION_STRUCTURE;
     object->initial_state = initial_state;
 
+    if (vkd3d_runtime_config.rtv_init_fix &&
+            !(flags & (VKD3D_RESOURCE_RESERVED | VKD3D_RESOURCE_EXTERNAL)) &&
+            (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+    {
+        object->needs_initial_clear = true;
+    }
+
     if (heap_properties)
         object->heap_properties = *heap_properties;
     object->heap_flags = heap_flags;
@@ -4050,6 +4057,15 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
             &object)))
         return hr;
 
+    if (vkd3d_runtime_config.force_shared_rtv &&
+            (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+            !(heap_flags & D3D12_HEAP_FLAG_SHARED) &&
+            !(object->flags & VKD3D_RESOURCE_LINEAR_STAGING_COPY))
+    {
+        heap_flags |= D3D12_HEAP_FLAG_SHARED;
+        object->heap_flags |= D3D12_HEAP_FLAG_SHARED;
+    }
+
     if (d3d12_resource_is_texture(object))
     {
         VkMemoryDedicatedRequirements dedicated_requirements;
@@ -4143,7 +4159,10 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
                 allocate_info.pNext = &export_info;
             }
 #else
-            FIXME("D3D12_HEAP_FLAG_SHARED can only be implemented in native Win32.\n");
+            export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+            export_info.pNext = allocate_info.pNext;
+            export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+            allocate_info.pNext = &export_info;
 #endif
         }
 

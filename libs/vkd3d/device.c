@@ -530,6 +530,7 @@ enum vkd3d_application_feature_override
 static enum vkd3d_application_feature_override vkd3d_application_feature_override;
 uint64_t vkd3d_config_flags;
 struct vkd3d_shader_quirk_info vkd3d_shader_quirk_info;
+struct vkd3d_runtime_config vkd3d_runtime_config;
 
 struct vkd3d_instance_application_meta
 {
@@ -986,6 +987,14 @@ static void vkd3d_instance_apply_application_workarounds(void)
         }
     }
 
+    if (!vkd3d_runtime_config.rtv_init_fix &&
+            vkd3d_string_compare(VKD3D_STRING_COMPARE_STARTS_WITH, app, "StarCitizen"))
+    {
+        INFO("Detected game %s, enabling RTV initialization workaround.\n", app);
+        vkd3d_runtime_config.rtv_init_fix = true;
+        vkd3d_runtime_config.force_shared_rtv = true;
+    }
+
     for (i = 0; i < ARRAY_SIZE(application_shader_quirks); i++)
     {
         if (vkd3d_string_compare(application_shader_quirks[i].mode, app, application_shader_quirks[i].name))
@@ -1190,6 +1199,10 @@ static void vkd3d_config_flags_init_once(void)
 
     vkd3d_get_env_var("VKD3D_CONFIG", config, sizeof(config));
     vkd3d_config_flags = vkd3d_parse_debug_options(config, vkd3d_config_options, ARRAY_SIZE(vkd3d_config_options));
+    vkd3d_runtime_config.rtv_init_fix = vkd3d_debug_list_has_member(config, "rtv_init_fix");
+    vkd3d_runtime_config.force_shared_rtv = vkd3d_debug_list_has_member(config, "force_shared_rtv");
+    if (vkd3d_runtime_config.force_shared_rtv)
+        vkd3d_runtime_config.rtv_init_fix = true;
 
     if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_SKIP_APPLICATION_WORKAROUNDS))
         vkd3d_instance_apply_application_workarounds();
@@ -1201,7 +1214,7 @@ static void vkd3d_config_flags_init_once(void)
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_VULKAN_DEBUG)
         vkd3d_config_flags |= VKD3D_CONFIG_FLAG_DEBUG_UTILS;
 
-    if (vkd3d_config_flags)
+    if (vkd3d_config_flags || vkd3d_runtime_config.rtv_init_fix || vkd3d_runtime_config.force_shared_rtv)
         INFO("VKD3D_CONFIG='%s'.\n", config);
 }
 
@@ -8081,6 +8094,12 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommittedResource2(d3d12_dev
             iface, heap_properties, heap_flags, desc, initial_state,
             optimized_clear_value, protected_session, debugstr_guid(iid), resource);
 
+    if (vkd3d_runtime_config.force_shared_rtv &&
+            desc && (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+    {
+        heap_flags |= D3D12_HEAP_FLAG_SHARED;
+    }
+
     if (protected_session)
         FIXME("Ignoring protected session %p.\n", protected_session);
 
@@ -8382,6 +8401,12 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommittedResource3(d3d12_dev
             "castable_formats %p, iid %s, resource %p stub!\n", iface,
             heap_properties, heap_flags, desc, initial_layout, optimized_clear_value, 
             protected_session, num_castable_formats, castable_formats, debugstr_guid(iid), resource);
+
+    if (vkd3d_runtime_config.force_shared_rtv &&
+            desc && (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+    {
+        heap_flags |= D3D12_HEAP_FLAG_SHARED;
+    }
 
     if (protected_session)
         FIXME("Ignoring protected session %p.\n", protected_session);

@@ -245,6 +245,14 @@ struct vkd3d_instance
 extern uint64_t vkd3d_config_flags;
 extern struct vkd3d_shader_quirk_info vkd3d_shader_quirk_info;
 
+struct vkd3d_runtime_config
+{
+    bool rtv_init_fix;
+    bool force_shared_rtv;
+};
+
+extern struct vkd3d_runtime_config vkd3d_runtime_config;
+
 struct vkd3d_queue_timeline_trace_cookie
 {
     unsigned int index;
@@ -1134,6 +1142,7 @@ struct d3d12_resource
     VkImageLayout common_layout;
     D3D12_RESOURCE_STATES initial_state;
     uint32_t initial_layout_transition;
+    bool needs_initial_clear;
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     bool initial_layout_transition_validate_only;
