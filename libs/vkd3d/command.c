@@ -21333,6 +21333,14 @@ static void d3d12_command_queue_signal_shared(struct d3d12_command_queue *comman
 }
 
 #define VKD3D_COMMAND_QUEUE_NUM_TRANSITION_BUFFERS 16
+
+struct d3d12_initial_transition_barrier
+{
+    const struct d3d12_resource *resource;
+    VkImageMemoryBarrier2 barrier;
+    bool clear_rtv;
+};
+
 struct d3d12_command_queue_transition_pool
 {
     VkCommandBuffer cmd[VKD3D_COMMAND_QUEUE_NUM_TRANSITION_BUFFERS];
@@ -21340,7 +21348,7 @@ struct d3d12_command_queue_transition_pool
     VkSemaphore timeline;
     uint64_t timeline_value;
 
-    VkImageMemoryBarrier2 *barriers;
+    struct d3d12_initial_transition_barrier *barriers;
     size_t barriers_size;
     size_t barriers_count;
 
@@ -21420,8 +21428,16 @@ static void d3d12_command_queue_transition_pool_add_barrier(struct d3d12_command
         return;
     }
 
-    if (vk_image_memory_barrier_for_initial_transition(resource, &pool->barriers[pool->barriers_count]))
+    if (vk_image_memory_barrier_for_initial_transition(resource, &pool->barriers[pool->barriers_count].barrier))
+    {
+        pool->barriers[pool->barriers_count].resource = resource;
+        pool->barriers[pool->barriers_count].clear_rtv =
+                vkd3d_runtime_config.rtv_init_fix &&
+                (resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+                (resource->format->vk_aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) &&
+                resource->needs_initial_clear;
         pool->barriers_count++;
+    }
 }
 
 static void d3d12_command_queue_transition_pool_add_query_heap(struct d3d12_command_queue_transition_pool *pool,
@@ -21543,8 +21559,6 @@ static void d3d12_command_queue_transition_pool_build(struct d3d12_command_queue
 
     memset(&dep_info, 0, sizeof(dep_info));
     dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    dep_info.imageMemoryBarrierCount = pool->barriers_count;
-    dep_info.pImageMemoryBarriers = pool->barriers;
 
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_INSTRUCTION_QA_CHECKS)
     {
@@ -21563,8 +21577,93 @@ static void d3d12_command_queue_transition_pool_build(struct d3d12_command_queue
             INFO("QA: Updating VA timestamp to %u (#%x) between submission.\n", value, value);
     }
 
-    if (pool->barriers_count)
-        VK_CALL(vkCmdPipelineBarrier2(pool->cmd[command_index], &dep_info));
+    /* First emit any initial transitions that do not require clears. */
+    {
+        VkImageMemoryBarrier2 *plain_barriers = NULL;
+        size_t plain_count = 0, plain_index = 0;
+
+        for (i = 0; i < pool->barriers_count; i++)
+            if (!pool->barriers[i].clear_rtv)
+                plain_count++;
+
+        if (plain_count)
+        {
+            plain_barriers = vkd3d_calloc(plain_count, sizeof(*plain_barriers));
+            if (!plain_barriers)
+            {
+                ERR("Failed to allocate initial barrier list.\n");
+                plain_count = 0;
+            }
+        }
+
+        if (plain_barriers)
+        {
+            for (i = 0; i < pool->barriers_count; i++)
+            {
+                if (!pool->barriers[i].clear_rtv)
+                    plain_barriers[plain_index++] = pool->barriers[i].barrier;
+            }
+
+            dep_info.imageMemoryBarrierCount = (uint32_t)plain_count;
+            dep_info.pImageMemoryBarriers = plain_barriers;
+            VK_CALL(vkCmdPipelineBarrier2(pool->cmd[command_index], &dep_info));
+        }
+
+        /* Handle RTV clears inline. */
+        for (i = 0; i < pool->barriers_count; i++)
+        {
+            const struct d3d12_initial_transition_barrier *b = &pool->barriers[i];
+            const struct d3d12_resource *resource = b->resource;
+
+            if (!b->clear_rtv)
+                continue;
+
+            {
+                VkImageMemoryBarrier2 to_transfer = b->barrier;
+                to_transfer.oldLayout = b->barrier.oldLayout;
+                to_transfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                to_transfer.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+                to_transfer.srcAccessMask = 0;
+                to_transfer.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                to_transfer.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                VK_CALL(vkCmdPipelineBarrier2(pool->cmd[command_index], &(VkDependencyInfo){
+                        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                        .imageMemoryBarrierCount = 1,
+                        .pImageMemoryBarriers = &to_transfer,
+                }));
+            }
+
+            {
+                VkClearColorValue clear_value = {0};
+                VkImageSubresourceRange range = b->barrier.subresourceRange;
+                range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+
+                VK_CALL(vkCmdClearColorImage(pool->cmd[command_index],
+                        resource->res.vk_image,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        &clear_value, 1, &range));
+            }
+
+            {
+                VkImageMemoryBarrier2 to_target = b->barrier;
+                to_target.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                to_target.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                to_target.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                to_target.dstStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                to_target.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+                VK_CALL(vkCmdPipelineBarrier2(pool->cmd[command_index], &(VkDependencyInfo){
+                        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                        .imageMemoryBarrierCount = 1,
+                        .pImageMemoryBarriers = &to_target,
+                }));
+            }
+
+            ((struct d3d12_resource *)resource)->needs_initial_clear = false;
+        }
+
+        vkd3d_free(plain_barriers);
+    }
 
     for (i = 0; i < pool->query_heaps_count; i++)
         d3d12_command_queue_init_query_heap(device, pool->cmd[command_index], pool->query_heaps[i]);
